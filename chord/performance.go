@@ -2,9 +2,20 @@ package chord
 
 import (
 	"fmt"
+	"github.com/ahrtr/logrus"
 	"math/rand"
 	"time"
+	"os"
+	"encoding/csv"
+	"strconv"
 )
+
+type PerformanceParams struct {
+	N             int
+	NumQueries    int
+	QuerySteps    int
+	NumQuerySteps int
+}
 
 type CPUPerformance struct {
 	/*
@@ -14,7 +25,7 @@ type CPUPerformance struct {
 		Operation (string): The operation that the CPU Utilization corresponds to
 		Configuration (Config): The details of the run (number of runs, number of events, order of events, etc.)
 	*/
-	Node          string
+	Node          int
 	TimeElapsed   time.Duration
 	Operation     string
 	Configuration Config
@@ -26,19 +37,41 @@ type QueryPerformance struct {
 		NumberOfQueries (int): The number of queries in the batch
 		TimeElapsed (time.Duration): Time elapsed in processing the batch
 	*/
-	Run             int
 	NumberOfQueries int
 	TimeElapsed     time.Duration
+	NumJumps        float64
+	Lookups         float64
 }
 
 var CPUPerformanceMetrics []CPUPerformance
 var QueryPerformanceMetrics []QueryPerformance
+var CorrectnessResults []CorrectnessResult
+var Events []Event
+var States []State
+
+type State struct {
+	SingleState []Nodes
+}
+
+type Event struct {
+	Name   string
+	Cause  int
+	Affect int
+}
 
 func InitPerformance() {
 	rand.Seed(time.Now().UnixNano())
 }
 
-func MetricsHandler(node string, timeElapsed time.Duration, operation string, config Config) {
+func GetEvents() []Event {
+	return Events
+}
+
+func GetStates() []State {
+	return States
+}
+
+func MetricsHandler(node int, timeElapsed time.Duration, operation string, config Config) {
 	performance := CPUPerformance{
 		Node:          node,
 		TimeElapsed:   timeElapsed,
@@ -48,102 +81,59 @@ func MetricsHandler(node string, timeElapsed time.Duration, operation string, co
 	CPUPerformanceMetrics = append(CPUPerformanceMetrics, performance)
 }
 
-
-
-func (ring *Ring) TestPerformance(n, nQ, qS, nQS int) {
-	/*
-		This function performs tests on randomly generated queries.
-		Input:
-			ring (*Ring): The ring on which the tests are to be performed
-			num (int): Number of runs that need to be performed on the ring
-		Output:
-			This function fills global object queryPerformanceMetric with the metrics collected during testing
-	*/
-	numQueries := nQ
-	for i := 0; i < nQS; i++ {
-		for j := 0; j < n; j++ {
-			queries := generateQueries(numQueries)
-			start := time.Now()
+/*
+	This function collects the following performance metrics:
+	1. Average Jump Number/Mean Path Length (as in Tsukamoto et. al.,
+	   "Implementation and Evaluation of Distributed Hash Table Using MPI" and
+	   Stoica et. al., "Chord: A scalable peer-to-peer lookup service for internet applications")
+	2. Average Finger Table Lookup (as in Tsukamoto et. al.,
+	   "Implementation and Evaluation of Distributed Hash Table Using MPI")
+	3 Average Lookup Latency (as in Stoica et. al.,
+	   "Chord: A scalable peer-to-peer lookup service for internet applications")
+	4. Average Stabilization Time
+)
+*/
+func (r *Ring) TestPerformance(params PerformanceParams) {
+	for i := 0; i < params.NumQuerySteps; i++ {
+		start := time.Now()
+		jumps := 0
+		lookups := 0
+		for j := 0; j < params.N; j++ {
+			queries := generateQueries(params.NumQueries)
 			for _, query := range queries {
-				if query[0] == "GET" {
-					nodes, err := ring.Lookup(1, []byte(query[1]))
-					if err != nil {
-						fmt.Println("Error in Lookup:", err.Error())
-					}
-					localNode, err := ring.GetLocalNode(nodes[0])
-					if err != nil {
-						fmt.Println("Node not found")
-					}
-					value, err := localNode.DataStore.Get(query[1])
-					if err != nil {
-						fmt.Println(err.Error())
-					} else {
-						fmt.Println(string(value))
-					}
-				} else if query[0] == "SET" {
-					nodes, err := ring.Lookup(1, []byte(query[1]))
-					if err != nil {
-						fmt.Println("Error in Lookup:", err.Error())
-					}
-					localNode, err := ring.GetLocalNode(nodes[0])
-					if err != nil {
-						fmt.Println("Node not found")
-					}
-					err = localNode.DataStore.Set(query[1], query[2])
-					if err != nil {
-						fmt.Println(err.Error())
-					} else {
-						fmt.Println("True")
-					}
-				} else if query[0] == " DELETE" {
-					nodes, err := ring.Lookup(1, []byte(query[1]))
-					if err != nil {
-						fmt.Println("Error in Lookup:", err.Error())
-					}
-					localNode, err := ring.GetLocalNode(nodes[0])
-					if err != nil {
-						fmt.Println("Node not found")
-					}
-					err = localNode.DataStore.Delete(query[1])
-					if err != nil {
-						fmt.Println(err.Error())
-					} else {
-						fmt.Println("True")
-					}
+				successors, val, lookup, err := r.vnodes[0].FindSuccessors(1, []byte(query))
+				if err != nil {
+					logrus.Errorln("Cannot find successors:", err.Error())
+				} else {
+					logrus.Infof("Node %d found for key %s", successors[0].Num, query)
 				}
+				jumps += val
+				lookups += lookup
 			}
-			queryPerformanceMetric := QueryPerformance{
-				Run:             j,
-				NumberOfQueries: numQueries,
-				TimeElapsed:     time.Since(start),
-			}
-			QueryPerformanceMetrics = append(QueryPerformanceMetrics, queryPerformanceMetric)
 		}
-		numQueries += qS
+		jumpsFloat := float64(jumps) / float64(params.NumQueries * params.N)
+		lookupsFloat := float64(lookups) / float64(params.NumQueries * params.N)
+		queryPerformanceMetric := QueryPerformance{
+			NumberOfQueries: params.NumQueries,
+			TimeElapsed:     time.Since(start),
+			NumJumps:        jumpsFloat,
+			Lookups:         lookupsFloat,
+		}
+		QueryPerformanceMetrics = append(QueryPerformanceMetrics, queryPerformanceMetric)
+		params.NumQueries += params.QuerySteps
 	}
+	time.Sleep(20 * time.Second)
 }
 
-func generateQueries(num int) [][]string {
-	/*
-		This function generates a random sequence of queries (GET, SET, DELETE)
-		Input:
-			num (int): the number of queries needed to be generated
-		Output:
-			queries ([][]string): Returns an array of Queries of the form (["Key", "Value"])
-	*/
-	var queries [][]string
-	possibleTypesOfQueries := []string{"GET", "SET", "DELETE"}
+/*
+	Random queries are generated for simulation.
+	Input:
+		num (int): Number of queries required
+*/
+func generateQueries(num int) []string {
+	var queries []string
 	for i := 0; i < num; i++ {
-		val := rand.Intn(len(possibleTypesOfQueries))
-		var query []string
-		query = append(query, possibleTypesOfQueries[val])
-		if query[0] == "GET" || query[0] == "DELETE" {
-			query = append(query, RandStringRunes(8))
-		} else {
-			query = append(query, RandStringRunes(8))
-			query = append(query, RandStringRunes(8))
-		}
-		queries = append(queries, query)
+		queries = append(queries, RandStringRunes(8))
 	}
 	return queries
 }
@@ -164,17 +154,139 @@ func RandStringRunes(n int) string {
 	return string(b)
 }
 
-func (r *Ring) Simulate(n int) {
-	var keys []string
-	for i := 0; i < n; i++ {
-		key := RandStringRunes(8)
-		keys = append(keys, key)
+/*
+	This function is used to generate logs regarding query performance and CPU utilization
+	of the run.
+	Results are saved in queryPerformance.csv and cpuPerformance.csv
+*/
+func LogStats(num int, numNodes int) {
+	queryFile, err := os.Create("queryPerformance.csv")
+	if err != nil {
+		logrus.Errorln("Cannot create file", err.Error())
+		return
 	}
-	for _, key := range keys {
-		_, err := r.Lookup(1, []byte(key))
+	defer queryFile.Close()
+
+	cpuFile, err := os.Create("cpuPerformance.csv")
+	if err != nil {
+		logrus.Errorln("Cannot create file", err.Error())
+		return
+	}
+	defer cpuFile.Close()
+
+	queryWriter := csv.NewWriter(queryFile)
+
+	var queryHeader []string
+	queryHeader = append(queryHeader, "Number of Nodes")
+	queryHeader = append(queryHeader, "Number of Queries (nQ)")
+	queryHeader = append(queryHeader, "Number of Runs (n)")
+	queryHeader = append(queryHeader, "Average Lookup Latency (for all queries)")
+	queryHeader = append(queryHeader, "Average Lookup Latency (per query)")
+	queryHeader = append(queryHeader, "Average Jump Number")
+	queryHeader = append(queryHeader, "Average Lookup Finger Table Number")
+	err = queryWriter.Write(queryHeader)
+	if err != nil {
+		logrus.Errorln("Unable to write query header:", err.Error())
+		return
+	}
+
+	var queryData [][]string
+	for _, queryPerformance := range QueryPerformanceMetrics {
+		var data []string
+		data = append(data, strconv.Itoa(numNodes))
+		data = append(data, strconv.Itoa(queryPerformance.NumberOfQueries))
+		data = append(data, strconv.Itoa(num))
+		data = append(data, strconv.Itoa(int(queryPerformance.TimeElapsed) / num))
+		data = append(data, strconv.Itoa(int(queryPerformance.TimeElapsed)/(queryPerformance.NumberOfQueries * num)))
+		data = append(data, fmt.Sprintf("%f", queryPerformance.NumJumps))
+		data = append(data, fmt.Sprintf("%f", queryPerformance.Lookups))
+		queryData = append(queryData, data)
+	}
+
+	for _, data := range queryData {
+		err = queryWriter.Write(data)
 		if err != nil {
-			fmt.Println("Error in Lookup:", err.Error())
+			logrus.Errorln("Unable to write query record:", err.Error())
+			return
 		}
-		// To implement get trace
 	}
+	queryWriter.Flush()
+
+	cpuWriter := csv.NewWriter(cpuFile)
+
+	var cpuHeader []string
+	cpuHeader = append(cpuHeader, "Node")
+	cpuHeader = append(cpuHeader, "Number of schedules")
+	cpuHeader = append(cpuHeader, "Average Schedule Time")
+	cpuHeader = append(cpuHeader, "Number of stabilizations")
+	cpuHeader = append(cpuHeader, "Average Stabilization Time")
+	err = cpuWriter.Write(cpuHeader)
+	if err != nil {
+		logrus.Errorln("Unable to write cpu header:", err.Error())
+		return
+	}
+
+	var cpuData [][]string
+	nodeScheduleMap := make(map[int]time.Duration)
+	nodeScheduleNumberMap := make(map[int]int)
+	totalScheduleTime := time.Duration(0)
+	schedule := 0
+	nodeStabilizationMap := make(map[int]time.Duration)
+	nodeStabilizationNumberMap := make(map[int]int)
+	totalStabilizationTime := time.Duration(0)
+	stabilization := 0
+	for _, cpuPerformance := range CPUPerformanceMetrics {
+		if cpuPerformance.Operation == "schedule" {
+			if val, ok := nodeScheduleMap[cpuPerformance.Node]; ok {
+				val += cpuPerformance.TimeElapsed
+				nodeScheduleMap[cpuPerformance.Node] = val
+				nodeScheduleNumberMap[cpuPerformance.Node] = nodeScheduleNumberMap[cpuPerformance.Node] + 1
+			} else {
+				nodeScheduleMap[cpuPerformance.Node] = cpuPerformance.TimeElapsed
+				nodeScheduleNumberMap[cpuPerformance.Node] = 1
+			}
+			totalScheduleTime += cpuPerformance.TimeElapsed
+			schedule++
+		} else if cpuPerformance.Operation == "stabilization" {
+			if val, ok := nodeStabilizationMap[cpuPerformance.Node]; ok {
+				val += cpuPerformance.TimeElapsed
+				nodeStabilizationMap[cpuPerformance.Node] = val
+				nodeStabilizationNumberMap[cpuPerformance.Node] = nodeStabilizationNumberMap[cpuPerformance.Node] + 1
+			} else {
+				nodeStabilizationMap[cpuPerformance.Node] = cpuPerformance.TimeElapsed
+				nodeStabilizationNumberMap[cpuPerformance.Node] = 1
+			}
+			totalStabilizationTime += cpuPerformance.TimeElapsed
+			stabilization++
+		}
+	}
+
+	for node, value := range nodeScheduleMap {
+		var data []string
+		data = append(data, strconv.Itoa(node))
+		data = append(data, strconv.Itoa(nodeScheduleNumberMap[node]))
+		data = append(data, strconv.Itoa(int(value)/nodeScheduleNumberMap[node]))
+		data = append(data, strconv.Itoa(nodeStabilizationNumberMap[node]))
+		data = append(data, strconv.Itoa(int(nodeStabilizationMap[node])/nodeStabilizationNumberMap[node]))
+		cpuData = append(cpuData, data)
+	}
+
+	var data []string
+	data = append(data, "All")
+	data = append(data, strconv.Itoa(schedule))
+	data = append(data, strconv.Itoa(int(totalScheduleTime)/schedule))
+	data = append(data, strconv.Itoa(stabilization))
+	data = append(data, strconv.Itoa(int(totalStabilizationTime)/stabilization))
+	cpuData = append(cpuData, data)
+
+	for _, data := range cpuData {
+		err = cpuWriter.Write(data)
+		if err != nil {
+			logrus.Errorln("Unable to write cpu record:", err.Error())
+			return
+		}
+	}
+	cpuWriter.Flush()
+
+	return
 }

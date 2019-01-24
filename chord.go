@@ -4,16 +4,21 @@ import (
 	"bufio"
 	"correct-chord-go/chord"
 	"fmt"
+	"github.com/ahrtr/logrus"
 	"os"
-	"strings"
 	"strconv"
+	"strings"
 )
 
 func main() {
 
 	/*
-
-	*/
+		This is the entry point of the project. 4 modes are possible, which is described in detail later on.
+		1. DHT
+		2. Simulation
+		3. Correctness Testing
+		4. Performance Testing
+	 */
 
 	arguments := os.Args[1:]
 	caseRunning := ""
@@ -21,15 +26,14 @@ func main() {
 		caseRunning = "dht"
 	} else {
 		caseRunning = arguments[0]
-		if caseRunning != "dht" && caseRunning != "correctness" {
-			fmt.Println("Unknown argument for the case to run. It should be either dht or simulate")
+		if caseRunning != "dht" && caseRunning != "correctness" && caseRunning != "simulation" && caseRunning != "performance" {
+			fmt.Println("Unknown argument for the case to run.")
 			return
 		}
 	}
 
 	config := chord.DefaultConfig("local")
-	trans := chord.InitLocalTransport(nil)
-	ring, err := chord.Create(config, trans)
+	ring, err := chord.Create(config, nil)
 	if err != nil {
 		fmt.Println("error in creating ring:", err.Error())
 		return
@@ -67,13 +71,14 @@ func main() {
 				- Doesn't do anything if the key is not found.
 
 		2. Simulation
-			Input: [#queries, queries]
-			Output: [traces_of_lookup]
+			Input: [Mode="simulation", numNodes, numEvents]
+			Output: [simulation_logs.txt]
 			- Will execute a set of queries and show the trace for accessing of nodes for each one of them.
 
 		3. Correctness (correctness)
-		    Input: [#runs, min_stabilization_time, max_stabilization_time, stabilization_step, event_sleep_time, event_sleep_step]
-			Output: [correctness_truth_value, logs]
+		    Input: [Mode="correctness", version, numNodes, numSuccessors, numRuns, MinStabilizationTime, MaxStabilizationTime,
+			StabilizationTimeSteps, nStabilizationTimeSteps, EventFireDelay, EventFireDelaySteps, NumberEventFireDelaySteps]
+			Output: [correctnessResults.csv, correctness_logs.txt]
 			- Constructs various chord rings based on the different configurations provided.
 			- For each ring that is generated, a series of random events is fired at variable time periods.
 			- The random events under consideration are JOIN, LEAVE, FAILURE.
@@ -93,8 +98,8 @@ func main() {
 			- Logs generated show the sequence of events, final ring state, and the invariants that were violated in the run.
 
 		4. Performance (performance)
-		   Input: [#runs, #queries, query_step]
-		   Output: [average_cpu_performance, average_jump_number, average_finger_lookup, query_performance]
+		   Input: [mode="performance", numNodes, numRuns, NumQueries, querySteps, NumQuerySteps]
+		   Output: [cpuPerformance.csv, queryPerformance.csv]
 		   Performance will be evaluated on the following metrics:
 		   a. CPU Time: The time taken by the ring to stabilize.
 		   b. Average Jump Number: The mean length of the paths followed to retrieve a particular node.
@@ -178,32 +183,117 @@ func main() {
 			}
 		}
 	} else if caseRunning == "simulation" {
-		n, _ := strconv.Atoi(arguments[1])
-		ring.Simulate(n)
+		filename := "simulation_logs.txt"
+		f, err := os.OpenFile(filename, os.O_WRONLY|os.O_CREATE, 0755)
+		if err != nil {
+			fmt.Println("Couldn't open file, got: ", err.Error())
+			return
+		}
+		formatter := &logrus.JSONFormatter{
+			DisableTimestamp: true,
+		}
+		logrus.SetFormatter(formatter)
+		logrus.SetOutput(f)
+		nN, _ := strconv.Atoi(arguments[1])
+		n, _ := strconv.Atoi(arguments[2])
+		config := chord.DefaultConfig("local")
+		config.NumVnodes = nN
+		config.NumSuccessors = 3
+		ring, err := chord.Create(config, nil)
+		if err != nil {
+			fmt.Println("error in creating ring:", err.Error())
+			return
+		}
+		ring.Simulate(n, nN)
 	} else if caseRunning == "correctness" {
 		//This check will be run on multiple values changing the stabilization time and other parameters.
+		filename := "correctness_logs.txt"
+		f, err := os.OpenFile(filename, os.O_WRONLY|os.O_CREATE, 0755)
+		if err != nil {
+			fmt.Println("Couldn't open file, got: ", err.Error())
+			return
+		}
+		formatter := &logrus.TextFormatter{
+			DisableQuoteFields: true,
+			DisableKeyFields:   true,
+		}
+		logrus.SetFormatter(formatter)
+		logrus.SetOutput(f)
 		chord.InitPerformance()
-		n, _ := strconv.Atoi(arguments[1])
-		minST, _ := strconv.Atoi(arguments[2])
-		maxST, _ := strconv.Atoi(arguments[3])
-		sTS, _ := strconv.Atoi(arguments[4])
-		nSTS, _ := strconv.Atoi(arguments[5])
-		eFD, _ := strconv.Atoi(arguments[6])
-		eFDS, _ := strconv.Atoi(arguments[7])
-		nEFDS, _ := strconv.Atoi(arguments[8])
-		pass, err := chord.TestCorrectness(n, minST, maxST, sTS, nSTS, eFD, eFDS, nEFDS)
+		version := arguments[1]
+		if version != "new" && version != "old" {
+			fmt.Println("Not a valid version to test for correctness")
+			return
+		}
+		nN, _ := strconv.Atoi(arguments[2])
+		numSuccessors, _ := strconv.Atoi(arguments[3])
+		n, _ := strconv.Atoi(arguments[4])
+		minST, _ := strconv.Atoi(arguments[5])
+		maxST, _ := strconv.Atoi(arguments[6])
+		sTS, _ := strconv.Atoi(arguments[7])
+		nSTS, _ := strconv.Atoi(arguments[8])
+		eFD, _ := strconv.Atoi(arguments[9])
+		eFDS, _ := strconv.Atoi(arguments[10])
+		nEFDS, _ := strconv.Atoi(arguments[11])
+		params := chord.CorrectnessParams{
+			Version:                   version,
+			NumNodes:                  nN,
+			NumSuccessors:             numSuccessors,
+			N:                         n,
+			MinStabilizationTime:      minST,
+			MaxStabilizationTime:      maxST,
+			StabilizationTimeSteps:    sTS,
+			NumberStabilizationSteps:  nSTS,
+			EventFireDelay:            eFD,
+			EventFireDelaySteps:       eFDS,
+			NumberEventFireDelaySteps: nEFDS,
+		}
+		pass, err := chord.TestCorrectness(params)
 		if err != nil {
 			fmt.Println(err.Error())
 			return
 		}
 		fmt.Println(pass)
+		fmt.Println(chord.CorrectnessResults)
+		chord.LogCorrectness()
 	} else if caseRunning == "performance" {
+		filename := "performance_logs.txt"
+		f, err := os.OpenFile(filename, os.O_WRONLY|os.O_CREATE, 0755)
+		if err != nil {
+			fmt.Println("Couldn't open file, got: ", err.Error())
+			return
+		}
+		formatter := &logrus.TextFormatter {
+			DisableQuoteFields: true,
+			DisableKeyFields:   true,
+		}
+		logrus.SetFormatter(formatter)
+		logrus.SetOutput(f)
 		chord.InitPerformance()
-		n, _ := strconv.Atoi(arguments[1])
-		nQ, _ := strconv.Atoi(arguments[2])
-		qS, _ := strconv.Atoi(arguments[3])
-		nQS, _ := strconv.Atoi(arguments[4])
-		ring.TestPerformance(n, nQ, qS, nQS)
-		// TODO chord.GetStats()
+		nN, _ := strconv.Atoi(arguments[1])
+		n, _ := strconv.Atoi(arguments[2])
+		nQ, _ := strconv.Atoi(arguments[3])
+		qS, _ := strconv.Atoi(arguments[4])
+		nQS, _ := strconv.Atoi(arguments[5])
+
+		config := chord.DefaultConfig("local")
+		config.NumVnodes = nN
+		ring, err := chord.Create(config, nil)
+		if err != nil {
+			fmt.Println("error in creating ring:", err.Error())
+			return
+		}
+
+		params := chord.PerformanceParams{
+			N:             n,
+			NumQueries:    nQ,
+			QuerySteps:    qS,
+			NumQuerySteps: nQS,
+		}
+		ring.TestPerformance(params)
+		logrus.Infoln(chord.QueryPerformanceMetrics)
+		logrus.Infoln(chord.CPUPerformanceMetrics)
+		chord.LogStats(n, nN)
+		logrus.Infoln(ring.PrintNodes())
 	}
 }

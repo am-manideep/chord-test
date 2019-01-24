@@ -21,7 +21,7 @@ func (cp *closestPreceedingVnodeIterator) init(vn *localVnode, key []byte) {
 	cp.yielded = make(map[string]struct{})
 }
 
-func (cp *closestPreceedingVnodeIterator) Next() *Vnode {
+func (cp *closestPreceedingVnodeIterator) Next() (*Vnode, int) {
 	// Try to find each chord
 	var successor_node *Vnode
 	var finger_node *Vnode
@@ -56,6 +56,7 @@ func (cp *closestPreceedingVnodeIterator) Next() *Vnode {
 			break
 		}
 	}
+	fingerLookup := i
 	cp.finger_idx = i
 
 	// Determine which chord is better
@@ -70,20 +71,20 @@ func (cp *closestPreceedingVnodeIterator) Next() *Vnode {
 			cp.finger_idx--
 		}
 		cp.yielded[closest.String()] = struct{}{}
-		return closest
+		return closest, fingerLookup
 
 	} else if successor_node != nil {
 		cp.successor_idx--
 		cp.yielded[successor_node.String()] = struct{}{}
-		return successor_node
+		return successor_node, fingerLookup
 
 	} else if finger_node != nil {
 		cp.finger_idx--
 		cp.yielded[finger_node.String()] = struct{}{}
-		return finger_node
+		return finger_node, fingerLookup
 	}
 
-	return nil
+	return nil, 0
 }
 
 // Returns the closest preceeding Vnode to the key

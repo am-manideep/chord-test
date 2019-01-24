@@ -401,11 +401,11 @@ func (t *TCPTransport) Notify(target, self *Vnode) ([]*Vnode, error) {
 }
 
 // Find a successor
-func (t *TCPTransport) FindSuccessors(vn *Vnode, n int, k []byte) ([]*Vnode, error) {
+func (t *TCPTransport) FindSuccessors(vn *Vnode, n int, k []byte) ([]*Vnode, int, int, error) {
 	// Get a conn
 	out, err := t.getConn(vn.Host)
 	if err != nil {
-		return nil, err
+		return nil, 0, 0, err
 	}
 
 	respChan := make(chan []*Vnode, 1)
@@ -442,11 +442,11 @@ func (t *TCPTransport) FindSuccessors(vn *Vnode, n int, k []byte) ([]*Vnode, err
 
 	select {
 	case <-time.After(t.timeout):
-		return nil, fmt.Errorf("Command timed out!")
+		return nil, 0, 0, fmt.Errorf("Command timed out!")
 	case err := <-errChan:
-		return nil, err
+		return nil, 0, 0, err
 	case res := <-respChan:
-		return res, nil
+		return res, 0, 0, nil
 	}
 }
 
@@ -555,6 +555,13 @@ func (t *TCPTransport) Register(v *Vnode, o VnodeRPC) {
 	key := v.String()
 	t.lock.Lock()
 	t.local[key] = &localRPC{v, o}
+	t.lock.Unlock()
+}
+
+func (t *TCPTransport) Deregister(v *Vnode) {
+	key := v.String()
+	t.lock.Lock()
+	delete(t.local, key)
 	t.lock.Unlock()
 }
 
@@ -752,7 +759,7 @@ func (t *TCPTransport) handleConn(conn *net.TCPConn) {
 			resp := tcpBodyVnodeListError{}
 			sendResp = &resp
 			if ok {
-				nodes, err := obj.FindSuccessors(body.Num, body.Key)
+				nodes, _, _, err := obj.FindSuccessors(body.Num, body.Key)
 				resp.Vnodes = trimSlice(nodes)
 				resp.Err = err
 			} else {

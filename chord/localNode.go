@@ -1,15 +1,20 @@
 package chord
 
 import (
+	"bytes"
 	"correct-chord-go/global"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"log"
 	"time"
+	"github.com/ahrtr/logrus"
+	"math/rand"
 )
 
 // Represents an Vnode, local or remote
 type Vnode struct {
+	Num  int
 	Id   []byte // Virtual ID
 	Host string // Host identifier
 }
@@ -25,6 +30,7 @@ type localVnode struct {
 	stabilized  time.Time
 	timer       *time.Timer
 	DataStore   Storage
+	Shutdown    bool
 }
 
 // Converts the ID to string
@@ -36,6 +42,7 @@ func (vn *Vnode) String() string {
 func (vn *localVnode) init(idx int) {
 	// Generate an ID
 	vn.genId(uint16(idx))
+	vn.Num = idx
 
 	// Set our host
 	vn.Host = vn.ring.config.Hostname
@@ -50,14 +57,17 @@ func (vn *localVnode) init(idx int) {
 }
 
 // Schedules the Vnode to do regular maintenence
-func (vn *localVnode) schedule() {
+func (vn *localVnode) schedule(fail chan bool) {
 	// Setup our stabilize timer
 	defer vn.sendTimeToPerformanceMonitor(time.Now(), "schedule")
-	vn.timer = time.AfterFunc(RandStabilize(vn.ring.config), vn.stabilize)
+	f := func() {
+		vn.stabilize(fail)
+	}
+	vn.timer = time.AfterFunc(RandStabilize(vn.ring.config), f)
 }
 
 func (vn *localVnode) sendTimeToPerformanceMonitor(start time.Time, key string) {
-	MetricsHandler(string(vn.Id), time.Since(start), key, *vn.ring.config)
+	MetricsHandler(vn.Num, time.Since(start), key, *vn.ring.config)
 }
 
 // Generates an ID for the chord
@@ -73,7 +83,7 @@ func (vn *localVnode) genId(idx uint16) {
 }
 
 // Called to periodically stabilize the vnode
-func (vn *localVnode) stabilize() {
+func (vn *localVnode) stabilize(fail chan bool) {
 	start := time.Now()
 	// Clear the timer
 	vn.timer = nil
@@ -84,12 +94,16 @@ func (vn *localVnode) stabilize() {
 		return
 	}
 
+	if vn.Shutdown {
+		return
+	}
+
 	defer vn.sendTimeToPerformanceMonitor(start, "stabilization")
 	// Setup the next stabilize timer
-	defer vn.schedule()
+	defer vn.schedule(fail)
 
 	// Check for new successor
-	if err := vn.checkNewSuccessor(); err != nil {
+	if err := vn.checkNewSuccessor(fail); err != nil {
 		log.Printf("[ERR] Error checking for new successor: %s", err)
 	}
 
@@ -113,14 +127,19 @@ func (vn *localVnode) stabilize() {
 }
 
 // Checks for a new successor
-func (vn *localVnode) checkNewSuccessor() error {
+func (vn *localVnode) checkNewSuccessor(fail chan bool) error {
 	// Ask our successor for it's predecessor
 	trans := vn.ring.transport
 
 CHECK_NEW_SUC:
 	succ := vn.successors[0]
 	if succ == nil {
-		panic("Node has no successor!")
+		//panic("Node has no successor!")
+		fmt.Println("Node has no successor!")
+		if vn.predecessor == nil {
+			fail <- true
+		}
+		return errors.New("node has no successor" + vn.String())
 	}
 	maybe_suc, err := trans.GetPredecessor(succ)
 	if err != nil {
@@ -149,10 +168,14 @@ CHECK_NEW_SUC:
 	// Check if we should replace our successor
 	if maybe_suc != nil && global.Between(vn.Id, succ.Id, maybe_suc.Id) {
 		// Check if new successor is alive before switching
-		alive, err := trans.Ping(maybe_suc)
-		if alive && err == nil {
-			copy(vn.successors[1:], vn.successors[0:len(vn.successors)-1])
+		//alive, err := trans.Ping(maybe_suc)
+		if err == nil {
 			vn.successors[0] = maybe_suc
+			successors, _, _, err := trans.FindSuccessors(maybe_suc, vn.ring.config.NumSuccessors-1, maybe_suc.Id)
+			if err != nil {
+				return err
+			}
+			copy(vn.successors[1:], successors[:vn.ring.config.NumSuccessors-1])
 		} else {
 			return err
 		}
@@ -169,6 +192,9 @@ func (vn *localVnode) GetPredecessor() (*Vnode, error) {
 func (vn *localVnode) notifySuccessor() error {
 	// Notify successor
 	succ := vn.successors[0]
+	if succ == nil {
+		return errors.New("successor dead")
+	}
 	succ_list, err := vn.ring.transport.Notify(succ, &vn.Vnode)
 	if err != nil {
 		return err
@@ -219,11 +245,14 @@ func (vn *localVnode) fixFingerTable() error {
 	offset := global.PowerOffset(vn.Id, vn.last_finger, hb)
 
 	// Find the successor
-	nodes, err := vn.FindSuccessors(1, offset)
+	nodes, _, _, err := vn.FindSuccessors(1, offset)
 	if nodes == nil || len(nodes) == 0 || err != nil {
 		return err
 	}
 	node := nodes[0]
+	if node == nil {
+		return errors.New("no known successors")
+	}
 
 	// Update the finger table
 	vn.finger[vn.last_finger] = node
@@ -273,26 +302,37 @@ func (vn *localVnode) checkPredecessor() error {
 }
 
 // Finds next N successors. N must be <= NumSuccessors
-func (vn *localVnode) FindSuccessors(n int, key []byte) ([]*Vnode, error) {
+func (vn *localVnode) FindSuccessors(n int, key []byte) ([]*Vnode, int, int, error) {
 	// Check if we are the immediate predecessor
-	if vn.successors[0] != nil && global.BetweenRightIncl(vn.Id, vn.successors[0].Id, key) {
-		return vn.successors[:n], nil
+	if bytes.Compare(key, vn.Id) == 0 || vn.successors[0] == nil {
+		return vn.successors[:n], 1, rand.Intn(3) + vn.ring.config.NumSuccessors - 3, nil
 	}
+	if vn.successors[0] != nil && global.BetweenRightIncl(vn.Id, vn.successors[0].Id, key) {
+		return vn.successors[:n], 1, rand.Intn(3) + vn.ring.config.NumSuccessors - 3, nil
+	}
+	//if vn.successors[len(vn.successors)-1] != nil && bytes.Compare(key, vn.successors[len(vn.successors)-1].Id) == 1 {
+	//	res, val, fingerLookup, err := vn.ring.transport.FindSuccessors(vn.successors[len(vn.successors)-1], n, key)
+	//	if err == nil {
+	//		return res, 1+val, fingerLookup, nil
+	//	} else {
+	//		log.Printf("[ERR] Failed to contact %s. Got %s", vn.successors[len(vn.successors)-1].String(), err)
+	//	}
+	//}
 
 	// Try the closest preceeding nodes
 	cp := closestPreceedingVnodeIterator{}
 	cp.init(vn, key)
 	for {
 		// Get the next closest chord
-		closest := cp.Next()
+		closest, _ := cp.Next()
 		if closest == nil {
 			break
 		}
 
 		// Try that chord, break on success
-		res, err := vn.ring.transport.FindSuccessors(closest, n, key)
+		res, val, _, err := vn.ring.transport.FindSuccessors(closest, n, key)
 		if err == nil {
-			return res, nil
+			return res, 1+val, (1+val)*(rand.Intn(3) + vn.ring.config.NumSuccessors - 3), nil
 		} else {
 			log.Printf("[ERR] Failed to contact %s. Got %s", closest.String(), err)
 		}
@@ -308,12 +348,12 @@ func (vn *localVnode) FindSuccessors(n int, key []byte) ([]*Vnode, error) {
 			if len(remain) > n {
 				remain = remain[:n]
 			}
-			return remain, nil
+			return remain, 1, 0, nil
 		}
 	}
 
 	// Checked all closer nodes and our successors!
-	return nil, fmt.Errorf("Exhausted all preceeding nodes!")
+	return nil, 0, 0, fmt.Errorf(vn.Vnode.String() + ": Exhausted all preceeding nodes! and %d", successors)
 }
 
 // Instructs the vnode to leave
@@ -332,17 +372,53 @@ func (vn *localVnode) leave() error {
 	if vn.predecessor != nil {
 		err = trans.SkipSuccessor(vn.predecessor, &vn.Vnode)
 	}
+	//go vn.deregister()
 
 	// Notify successor to clear old predecessor
-	err = global.MergeErrors(err, trans.ClearPredecessor(vn.successors[0], &vn.Vnode))
+	if vn.successors[0] != nil {
+		err = trans.ClearPredecessor(vn.successors[0], &vn.Vnode)
+	}
+	vn.Shutdown = true
+	vn.ring.transport.Deregister(&vn.Vnode)
 	return err
 }
 
-func (vn *localVnode) join() error {
-	return nil
+func (vn *localVnode) deregister() {
+	time.Sleep(2 * time.Second)
+	vn.ring.transport.Deregister(&((*vn).Vnode))
+}
+
+func (vn *localVnode) join(node *localVnode) (*Vnode, error) {
+	successors, _, _, err := node.FindSuccessors(1, vn.Id)
+	if err != nil {
+		return nil, err
+	}
+	(*vn).successors[0] = successors[0]
+	successor := -1
+	if successors[0] != nil {
+		successor = successors[0].Num
+	} else {
+		return nil, errors.New("no successors found")
+	}
+	logrus.Infof("Node %d joining before Node %d", vn.Num, successor)
+	return successors[0], nil
+}
+
+func (vn *localVnode) joinNew(node *localVnode) (*Vnode, error) {
+	successors, _, _, err := node.FindSuccessors(vn.ring.config.NumSuccessors, vn.Id)
+	if err != nil {
+		return nil, err
+	}
+	for i := range successors {
+		(*vn).successors[i] = successors[i]
+	}
+	logrus.Infof("Node %d joining before Node %d", vn.Num, successors[0].Num)
+	return successors[0], nil
 }
 
 func (vn *localVnode) fail() error {
+	vn.Shutdown = true
+	vn.ring.transport.Deregister(&vn.Vnode)
 	return nil
 }
 

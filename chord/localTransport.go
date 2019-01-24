@@ -1,7 +1,6 @@
 package chord
 
 import (
-	"fmt"
 	"sync"
 )
 
@@ -104,7 +103,7 @@ func (lt *LocalTransport) Notify(vn, self *Vnode) ([]*Vnode, error) {
 	return lt.remote.Notify(vn, self)
 }
 
-func (lt *LocalTransport) FindSuccessors(vn *Vnode, n int, key []byte) ([]*Vnode, error) {
+func (lt *LocalTransport) FindSuccessors(vn *Vnode, n int, key []byte) ([]*Vnode, int, int, error) {
 	// Look for it locally
 	obj, ok := lt.get(vn)
 
@@ -160,16 +159,4 @@ func (lt *LocalTransport) Deregister(v *Vnode) {
 	lt.lock.Lock()
 	delete(lt.local, key)
 	lt.lock.Unlock()
-}
-
-func (*LocalTransport) Get(v *Vnode, key string) (string, error) {
-	return "", fmt.Errorf("Failed to connect! Blackhole: %s", v.String())
-}
-
-func (*LocalTransport) Set(v *Vnode, key string, value string) error {
-	return fmt.Errorf("Failed to connect! Blackhole: %s", v.String())
-}
-
-func (*LocalTransport) Delete(v *Vnode, key string) error {
-	return fmt.Errorf("Failed to connect! Blackhole: %s", v.String())
 }

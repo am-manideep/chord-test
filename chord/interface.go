@@ -3,7 +3,7 @@ package chord
 type VnodeRPC interface {
 	GetPredecessor() (*Vnode, error)
 	Notify(*Vnode) ([]*Vnode, error)
-	FindSuccessors(int, []byte) ([]*Vnode, error)
+	FindSuccessors(int, []byte) ([]*Vnode, int, int, error)
 	ClearPredecessor(*Vnode) error
 	SkipSuccessor(*Vnode) error
 }
@@ -36,7 +36,7 @@ type Transport interface {
 	Notify(target, self *Vnode) ([]*Vnode, error)
 
 	// Find a successor
-	FindSuccessors(*Vnode, int, []byte) ([]*Vnode, error)
+	FindSuccessors(*Vnode, int, []byte) ([]*Vnode, int, int, error)
 
 	// Clears a predecessor if it matches a given vnode. Used to leave.
 	ClearPredecessor(target, self *Vnode) error
@@ -47,8 +47,5 @@ type Transport interface {
 	// Register for an RPC callbacks
 	Register(*Vnode, VnodeRPC)
 
-	//Storage Functions
-	Get(*Vnode, string) (string, error)
-	Set(*Vnode, string, string) error
-	Delete(*Vnode, string) error
+	Deregister(*Vnode)
 }

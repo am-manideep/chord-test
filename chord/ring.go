@@ -11,6 +11,7 @@ import (
 	"math/rand"
 	"sort"
 	"time"
+	"github.com/ahrtr/logrus"
 )
 
 // Configuration for Chord nodes
@@ -27,11 +28,12 @@ type Config struct {
 
 // Stores the state required for a Chord ring
 type Ring struct {
-	config     *Config
-	transport  Transport
-	vnodes     []*localVnode
-	delegateCh chan func()
-	shutdown   chan bool
+	config                    *Config
+	transport                 Transport
+	vnodes                    []*localVnode
+	delegateCh                chan func()
+	shutdown                  chan bool
+	connectedAppendagesFailed bool
 }
 
 func (r *Ring) init(conf *Config, trans Transport) {
@@ -86,7 +88,7 @@ func (r *Ring) schedule() {
 		go r.delegateHandler()
 	}
 	for i := 0; i < len(r.vnodes); i++ {
-		r.vnodes[i].schedule()
+		r.vnodes[i].schedule(make(chan bool))
 	}
 }
 
@@ -161,11 +163,11 @@ func (r *Ring) safeInvoke(f func()) {
 func DefaultConfig(hostname string) *Config {
 	return &Config{
 		hostname,
-		8,        // 8 vnodes
+		64,       // 8 vnodes
 		sha1.New, // SHA1
-		time.Duration(15 * time.Second),
-		time.Duration(45 * time.Second),
-		2,   // 8 successors
+		time.Duration(5 * time.Second),
+		time.Duration(10 * time.Second),
+		8,   // 8 successors
 		nil, // No delegate
 		160, // 160bit hash function
 	}
@@ -181,10 +183,6 @@ func Create(conf *Config, trans Transport) (*Ring, error) {
 	ring.init(conf, trans)
 	ring.setLocalSuccessors()
 	ring.schedule()
-	fmt.Println(ring.vnodes)
-	for _, node := range ring.vnodes {
-		fmt.Println((*node).successors)
-	}
 	return ring, nil
 }
 
@@ -212,7 +210,7 @@ func Join(conf *Config, trans Transport, existing string) (*Ring, error) {
 		nearest := NearestVnodeToKey(hosts, vn.Id)
 
 		// Query for a list of successors to this Vnode
-		succs, err := trans.FindSuccessors(nearest, conf.NumSuccessors, vn.Id)
+		succs, _, _, err := trans.FindSuccessors(nearest, conf.NumSuccessors, vn.Id)
 		if err != nil {
 			return nil, fmt.Errorf("Failed to find successor for vnodes! Got %s", err)
 		}
@@ -233,7 +231,7 @@ func Join(conf *Config, trans Transport, existing string) (*Ring, error) {
 
 	// Do a fast stabilization, will schedule regular execution
 	for _, vn := range ring.vnodes {
-		vn.stabilize()
+		vn.stabilize(make(chan bool))
 	}
 	return ring, nil
 }
@@ -277,7 +275,7 @@ func (r *Ring) Lookup(n int, key []byte) ([]*Vnode, error) {
 	nearest := r.nearestVnode(key_hash)
 
 	// Use the nearest chord for the lookup
-	successors, err := nearest.FindSuccessors(n, key_hash)
+	successors, _, _, err := nearest.FindSuccessors(n, key_hash)
 	if err != nil {
 		return nil, err
 	}
@@ -323,14 +321,14 @@ func (r *Ring) PrintData() {
 	}
 }
 
-func (r *Ring) CheckCorrectness(num int, sleep time.Duration) bool {
+func (r *Ring) CheckCorrectness(num int, sleep time.Duration, version string) bool {
 	done := make(chan bool)
-	go r.checkCorrectness(num, sleep, done)
+	go r.checkCorrectness(num, sleep, done, version)
 	pass := <-done
 	return pass
 }
 
-func (r *Ring) checkCorrectness(num int, sleep time.Duration, done chan bool) {
+func (r *Ring) checkCorrectness(num int, sleep time.Duration, done chan bool, version string) {
 	/*
 		This function checks correctness by asserting the variants defined in correctness.go
 		Input:
@@ -339,22 +337,60 @@ func (r *Ring) checkCorrectness(num int, sleep time.Duration, done chan bool) {
 			The function will make assertions about Correctness invariants and send the result to a log
 	*/
 	events := r.generateEvents(num)
-	val := rand.Intn(len(r.vnodes))
+	id := len(r.vnodes)
+	logrus.Infof("Testing on %d events", num)
 	for _, event := range events {
+		val := rand.Intn(len(r.vnodes))
 		if event == "join" {
-			r.vnodes[val].join()
+			vn := &localVnode{}
+			vn.ring = r
+			vn.init(id)
+			id++
+			fmt.Println("join", vn, r.vnodes[2])
+			logrus.Infoln("join", vn.Num, r.vnodes[2].Num)
+			if version == "new" {
+				_, err := vn.joinNew(r.vnodes[2])
+				if err != nil {
+					logrus.Errorln("could not join the ring, found no valid successor")
+					continue
+				}
+			} else {
+				_, err := vn.join(r.vnodes[2])
+				if err != nil {
+					logrus.Errorln("could not join the ring, found no valid successor")
+					continue
+				}
+			}
+			r.vnodes = append(r.vnodes, vn)
+			go r.scheduleNode(vn)
+			sort.Sort(r)
 		}
 		if event == "leave" {
+			fmt.Println("leave", r.vnodes[val])
+			logrus.Infoln("leave", r.vnodes[val].Num)
 			r.vnodes[val].leave()
+			r.vnodes = append(r.vnodes[:val], r.vnodes[val+1:]...)
 		}
-		if event == "join" {
+		if event == "fail" {
+			fmt.Println("fail", r.vnodes[val])
+			logrus.Infoln("fail", r.vnodes[val].Num)
 			r.vnodes[val].fail()
+			r.vnodes = append(r.vnodes[:val], r.vnodes[val+1:]...)
 		}
-		CheckConsistencyInvariants(r)
 		time.Sleep(sleep)
+		logrus.Infoln(r.PrintNodes())
 	}
+	time.Sleep(20 * time.Second)
+	logrus.Infoln(r.PrintNodes())
 	pass := CheckCorrectnessInvariants(r)
 	done <- pass
+}
+
+func (r *Ring) scheduleNode(vn *localVnode) {
+	fail := make(chan bool)
+	go vn.schedule(fail)
+	r.connectedAppendagesFailed = <-fail
+
 }
 
 func (r *Ring) generateEvents(num int) []string {
@@ -365,11 +401,55 @@ func (r *Ring) generateEvents(num int) []string {
 		Output:
 			events ([]string): a sequence of randomly generated events, of length num
 	*/
-	possibleEvents := []string{"join", "leave", "fail"}
-	events := []string{}
+	var events []string
 	for i := 0; i < num; i++ {
-		val := rand.Intn(len(possibleEvents))
-		events = append(events, possibleEvents[val])
+		val := rand.Intn(10)
+		if val < 7 {
+			events = append(events, "join")
+		} else if val < 10 {
+			events = append(events, "leave")
+		} else {
+			events = append(events, "fail")
+		}
 	}
 	return events
+}
+
+type Nodes struct {
+	Node       int
+	Successors []int
+}
+
+func (r *Ring) PrintNodes() []Nodes {
+	var nodes []Nodes
+	vnodeMap := make(map[int]bool)
+	vnodeSuccessorsMap := make(map[int][]int)
+	vnodePredecessorMap := make(map[int]int)
+	for _, vnode := range r.vnodes {
+		vnodeMap[vnode.Num] = true
+		if vnode.predecessor != nil {
+			vnodePredecessorMap[vnode.Num] = vnode.predecessor.Num
+		} else {
+			vnodePredecessorMap[vnode.Num] = -1
+		}
+	}
+	for _, vnode := range r.vnodes {
+		vnodeSuccessorsMap[vnode.Num] = []int{}
+		var successors []int
+		for _, successor := range vnode.successors {
+			if successor != nil {
+				successors = append(successors, successor.Num)
+				if _, ok := vnodeMap[successor.Num]; ok {
+					vnodeSuccessorsMap[vnode.Num] = append(vnodeSuccessorsMap[vnode.Num], successor.Num)
+				} else {
+					vnodeSuccessorsMap[vnode.Num] = append(vnodeSuccessorsMap[vnode.Num], -1)
+				}
+			} else {
+				successors = append(successors, -1)
+				vnodeSuccessorsMap[vnode.Num] = append(vnodeSuccessorsMap[vnode.Num], -1)
+			}
+		}
+		nodes = append(nodes, Nodes{Node: vnode.Num, Successors: successors})
+	}
+	return nodes
 }
